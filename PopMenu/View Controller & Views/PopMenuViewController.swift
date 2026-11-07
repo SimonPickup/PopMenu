@@ -49,9 +49,15 @@ final public class PopMenuViewController: UIViewController {
     
     /// The source View to be displayed from.
     private(set) weak var sourceView: AnyObject?
+    /// Optional tap/click location in sourceView coordinates; nil uses its bounds.
+    private(set) var sourcePoint: CGPoint?
     
-    /// The absolute source frame relative to screen.
+    /// The source frame in this presentation view's local coordinates.
     private(set) var absoluteSourceFrame: CGRect?
+    private var lastLayoutBounds: CGRect?
+    private var lastLayoutInsets: UIEdgeInsets?
+    private var lastLayoutSourceFrame: CGRect?
+    private var actionsScrollView: UIScrollView?
     
     /// The calculated content frame.
     public lazy var contentFrame: CGRect = {
@@ -118,7 +124,21 @@ final public class PopMenuViewController: UIViewController {
     public private(set) var actions: [PopMenuAction] = []
     
     /// Max content width allowed for the content to stretch to.
-    fileprivate let maxContentWidth: CGFloat = UIScreen.main.bounds.size.width * 0.9
+    fileprivate var contentSafeAreaInsets: UIEdgeInsets {
+        if #available(iOS 11.0, *) { return view.safeAreaInsets }
+        return .zero
+    }
+
+    fileprivate var availableContentBounds: CGRect {
+        let safeBounds = view.bounds.inset(by: contentSafeAreaInsets)
+        let horizontalPadding = min(8, max(0, safeBounds.width / 2))
+        let verticalPadding = min(8, max(0, safeBounds.height / 2))
+        return safeBounds.insetBy(dx: horizontalPadding, dy: verticalPadding)
+    }
+
+    fileprivate var maxContentWidth: CGFloat {
+        return max(0, availableContentBounds.width)
+    }
     
     // MARK: - View Life Cycle
     
@@ -126,12 +146,14 @@ final public class PopMenuViewController: UIViewController {
     ///
     /// - Parameters:
     ///   - sourceView: the source view for triggering the menu
+    ///   - sourcePoint: optional tap/click point in sourceView coordinates; nil uses its bounds
     ///   - actions: all the menu actions
     ///   - appearance: appearance configuration
-    public convenience init(sourceView: AnyObject? = nil, actions: [PopMenuAction], appearance: PopMenuAppearance? = nil) {
+    public convenience init(sourceView: AnyObject? = nil, sourcePoint: CGPoint? = nil, actions: [PopMenuAction], appearance: PopMenuAppearance? = nil) {
         self.init(nibName: nil, bundle: nil)
         
         self.sourceView = sourceView
+        self.sourcePoint = sourcePoint
         self.actions = actions
 
         // Assign appearance or use the default one.
@@ -139,8 +161,6 @@ final public class PopMenuViewController: UIViewController {
             self.appearance = appearance
         }
 
-        setAbsoluteSourceFrame()
-        
         transitioningDelegate = self
         modalPresentationStyle = .overFullScreen
         modalPresentationCapturesStatusBarAppearance = true
@@ -157,11 +177,50 @@ final public class PopMenuViewController: UIViewController {
         configureActionsView()
     }
     
-    /// Set absolute source frame relative to screen frame.
+    /// Resolve the anchor only after attachment to the presentation container.
     fileprivate func setAbsoluteSourceFrame() {
         if let sourceView = sourceViewAsUIView {
-            absoluteSourceFrame = sourceView.convert(sourceView.bounds, to: nil)
+            var ancestor: UIView? = sourceView
+            while let current = ancestor {
+                if view.isDescendant(of: current) {
+                    let sourceRect = sourcePoint.map { CGRect(origin: $0, size: .zero) } ?? sourceView.bounds
+                    absoluteSourceFrame = sourceView.convert(sourceRect, to: view)
+                    return
+                }
+                ancestor = current.superview
+            }
         }
+        // If a previously resolved source scrolls away or is detached during
+        // dismissal, retain its last local anchor instead of jumping to centre.
+        // A source that has never shared this hierarchy remains unanchored.
+    }
+
+    /// Called by the animator after installing the final presentation frame.
+    func prepareForPresentation() {
+        updateContentLayout()
+        view.layoutIfNeeded()
+    }
+
+    public override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        updateContentLayout()
+    }
+
+    private func updateContentLayout() {
+        setAbsoluteSourceFrame()
+        guard lastLayoutBounds != view.bounds || lastLayoutInsets != contentSafeAreaInsets ||
+                lastLayoutSourceFrame != absoluteSourceFrame else { return }
+        lastLayoutBounds = view.bounds
+        lastLayoutInsets = contentSafeAreaInsets
+        lastLayoutSourceFrame = absoluteSourceFrame
+        contentFrame = calculateContentFittingFrame()
+        contentLeftConstraint.constant = contentFrame.minX
+        contentTopConstraint.constant = contentFrame.minY
+        contentWidthConstraint.constant = contentFrame.width
+        contentHeightConstraint.constant = contentFrame.height
+        let needsScrolling = CGFloat(actions.count) * appearance.popMenuActionHeight > contentFrame.height
+        actionsScrollView?.isScrollEnabled = needsScrolling
+        panGestureForMenu.isEnabled = !needsScrolling && actions.count < appearance.popMenuActionCountForScrollable
     }
     
     /// Add a new action to the menu.
@@ -209,13 +268,11 @@ final public class PopMenuViewController: UIViewController {
     ///   - size: Changed size
     ///   - coordinator: Coordinator that manages the container
     public override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
-        coordinator.animate(alongsideTransition: { context in
-            self.configureBackgroundView()
-            self.contentFrame = self.calculateContentFittingFrame()
-            self.setupContentConstraints()
-        })
-        
         super.viewWillTransition(to: size, with: coordinator)
+        coordinator.animate(alongsideTransition: { _ in
+            self.view.setNeedsLayout()
+            self.view.layoutIfNeeded()
+        })
     }
     
 }
@@ -226,7 +283,6 @@ extension PopMenuViewController {
     
     /// Setup the background view at the bottom.
     fileprivate func configureBackgroundView() {
-        backgroundView.frame = view.frame
         backgroundView.backgroundColor = .clear
         backgroundView.translatesAutoresizingMaskIntoConstraints = false
         backgroundView.addGestureRecognizer(tapGestureForDismissal)
@@ -240,9 +296,14 @@ extension PopMenuViewController {
             let blurStyle = backgroundStyle.blurStyle {
             
             let blurView = UIVisualEffectView(effect: UIBlurEffect(style: blurStyle))
-            blurView.frame = backgroundView.frame
-            
+            blurView.translatesAutoresizingMaskIntoConstraints = false
             backgroundView.addSubview(blurView)
+            NSLayoutConstraint.activate([
+                blurView.leftAnchor.constraint(equalTo: backgroundView.leftAnchor),
+                blurView.rightAnchor.constraint(equalTo: backgroundView.rightAnchor),
+                blurView.topAnchor.constraint(equalTo: backgroundView.topAnchor),
+                blurView.bottomAnchor.constraint(equalTo: backgroundView.bottomAnchor)
+            ])
         }
         
         // Dimmed background
@@ -255,6 +316,12 @@ extension PopMenuViewController {
         }
         
         view.insertSubview(backgroundView, at: 0)
+        NSLayoutConstraint.activate([
+            backgroundView.leftAnchor.constraint(equalTo: view.leftAnchor),
+            backgroundView.rightAnchor.constraint(equalTo: view.rightAnchor),
+            backgroundView.topAnchor.constraint(equalTo: view.topAnchor),
+            backgroundView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
     }
     
     /// Setup the content view.
@@ -337,7 +404,7 @@ extension PopMenuViewController {
             height = CGFloat(actions.count) * appearance.popMenuActionHeight
         }
         
-        let size = CGSize(width: calculateContentWidth(), height: height)
+        let size = CGSize(width: calculateContentWidth(), height: min(height, max(0, availableContentBounds.height)))
         let origin = calculateContentOrigin(with: size)
         
         return CGRect(origin: origin, size: size)
@@ -347,72 +414,23 @@ extension PopMenuViewController {
     ///
     /// - Returns: The source origin point
     fileprivate func calculateContentOrigin(with size: CGSize) -> CGPoint {
-        guard let sourceFrame = absoluteSourceFrame else { return CGPoint(x: view.center.x - size.width / 2, y: view.center.y - size.height / 2) }
-        let minContentPos: CGFloat = UIScreen.main.bounds.size.width * 0.05
-        let maxContentPos: CGFloat = UIScreen.main.bounds.size.width * 0.95
-        
-        // Get desired content origin point
-        let offsetX = (size.width - sourceFrame.size.width ) / 2
-        var desiredOrigin = CGPoint(x: sourceFrame.origin.x - offsetX, y: sourceFrame.origin.y)
-        if (desiredOrigin.x + size.width) > maxContentPos {
-            desiredOrigin.x = maxContentPos - size.width
-        }
-        if desiredOrigin.x < minContentPos {
-            desiredOrigin.x = minContentPos
-        }
-        
-        // Move content in place
-        translateOverflowX(desiredOrigin: &desiredOrigin, contentSize: size)
-        translateOverflowY(desiredOrigin: &desiredOrigin, contentSize: size)
-        
-        return desiredOrigin
-    }
-    
-    /// Move content into view if it's overflowed in X axis.
-    ///
-    /// - Parameters:
-    ///   - desiredOrigin: The desired origin point
-    ///   - contentSize: Content size
-    fileprivate func translateOverflowX(desiredOrigin: inout CGPoint, contentSize: CGSize) {
-        let edgePadding: CGFloat = 8
-        // Check content in left or right side
-        let leftSide = (desiredOrigin.x - view.center.x) < 0
-        
-        // Check view overflow
-        let origin = CGPoint(x: leftSide ? desiredOrigin.x : desiredOrigin.x + contentSize.width, y: desiredOrigin.y)
-        
-        // Move accordingly
-        if !view.frame.contains(origin) {
-            let overflowX: CGFloat = (leftSide ? 1 : -1) * ((leftSide ? view.frame.origin.x : view.frame.origin.x + view.frame.size.width) - origin.x) + edgePadding
-            
-            desiredOrigin = CGPoint(x: desiredOrigin.x - (leftSide ? -1 : 1) * overflowX, y: origin.y)
-        }
-    }
-    
-    /// Move content into view if it's overflowed in Y axis.
-    ///
-    /// - Parameters:
-    ///   - desiredOrigin: The desired origin point
-    ///   - contentSize: Content size
-    fileprivate func translateOverflowY(desiredOrigin: inout CGPoint, contentSize: CGSize) {
-        let edgePadding: CGFloat
-
-        let origin = CGPoint(x: desiredOrigin.x, y: desiredOrigin.y + contentSize.height)
-
-        if #available(iOS 11.0, *) {
-            edgePadding = UIApplication.shared.keyWindow?.safeAreaInsets.bottom ?? 8
+        let bounds = availableContentBounds
+        let desiredOrigin: CGPoint
+        if let sourceFrame = absoluteSourceFrame {
+            if sourcePoint != nil {
+                desiredOrigin = CGPoint(x: sourceFrame.minX + 8, y: sourceFrame.minY + 8)
+            } else {
+                desiredOrigin = CGPoint(x: sourceFrame.midX - size.width / 2, y: sourceFrame.minY)
+            }
         } else {
-            edgePadding = 8
+            desiredOrigin = CGPoint(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2)
         }
-        
-        // Check content inside of view or not
-        if !view.frame.contains(origin) {
-            let overFlowY: CGFloat = origin.y - view.frame.size.height + edgePadding
-            
-            desiredOrigin = CGPoint(x: desiredOrigin.x, y: desiredOrigin.y - overFlowY)
-        }
+        return CGPoint(
+            x: min(max(desiredOrigin.x, bounds.minX), max(bounds.minX, bounds.maxX - size.width)),
+            y: min(max(desiredOrigin.y, bounds.minY), max(bounds.minY, bounds.maxY - size.height))
+        )
     }
-    
+
     /// Determine the content width by the longest title possible.
     ///
     /// - Returns: The fitting width for content
@@ -464,45 +482,29 @@ extension PopMenuViewController {
             actionsView.addArrangedSubview(action.view)
         }
         
-        // Check add scroll view or not
-        if actions.count >= (appearance.popMenuActionCountForScrollable) {
-            // Scrollable actions
-            let scrollView = UIScrollView()
-            scrollView.translatesAutoresizingMaskIntoConstraints = false
-            scrollView.showsHorizontalScrollIndicator = false
-            scrollView.showsVerticalScrollIndicator = !appearance.popMenuScrollIndicatorHidden
-            scrollView.indicatorStyle = appearance.popMenuScrollIndicatorStyle
-            scrollView.contentSize.height = appearance.popMenuActionHeight * CGFloat(actions.count)
-            
-            scrollView.addSubview(actionsView)
-            contentView.addSubview(scrollView)
-            
-            NSLayoutConstraint.activate([
-                scrollView.leftAnchor.constraint(equalTo: contentView.leftAnchor),
-                scrollView.topAnchor.constraint(equalTo: contentView.topAnchor),
-                scrollView.rightAnchor.constraint(equalTo: contentView.rightAnchor),
-                scrollView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
-            ])
-            
-            NSLayoutConstraint.activate([
-                actionsView.leftAnchor.constraint(equalTo: contentView.leftAnchor),
-                actionsView.rightAnchor.constraint(equalTo: contentView.rightAnchor),
-                actionsView.topAnchor.constraint(equalTo: scrollView.topAnchor),
-                actionsView.heightAnchor.constraint(equalToConstant: scrollView.contentSize.height)
-            ])
-        } else {
-            // Not scrollable
-            actionsView.addGestureRecognizer(panGestureForMenu)
-            
-            contentView.addSubview(actionsView)
-            
-            NSLayoutConstraint.activate([
-                actionsView.leftAnchor.constraint(equalTo: contentView.leftAnchor),
-                actionsView.rightAnchor.constraint(equalTo: contentView.rightAnchor),
-                actionsView.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 4),
-                actionsView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -4)
-            ])
-        }
+        // Always retain natural row heights. A short/resized window scrolls even
+        // when the menu has fewer actions than the normal scrolling threshold.
+        let scrollView = UIScrollView()
+        actionsScrollView = scrollView
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.showsHorizontalScrollIndicator = false
+        scrollView.showsVerticalScrollIndicator = !appearance.popMenuScrollIndicatorHidden
+        scrollView.indicatorStyle = appearance.popMenuScrollIndicatorStyle
+        scrollView.addSubview(actionsView)
+        contentView.addSubview(scrollView)
+        actionsView.addGestureRecognizer(panGestureForMenu)
+        NSLayoutConstraint.activate([
+            scrollView.leftAnchor.constraint(equalTo: contentView.leftAnchor),
+            scrollView.topAnchor.constraint(equalTo: contentView.topAnchor),
+            scrollView.rightAnchor.constraint(equalTo: contentView.rightAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            actionsView.leftAnchor.constraint(equalTo: scrollView.leftAnchor),
+            actionsView.rightAnchor.constraint(equalTo: scrollView.rightAnchor),
+            actionsView.topAnchor.constraint(equalTo: scrollView.topAnchor),
+            actionsView.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor),
+            actionsView.widthAnchor.constraint(equalTo: scrollView.widthAnchor),
+            actionsView.heightAnchor.constraint(equalToConstant: appearance.popMenuActionHeight * CGFloat(actions.count))
+        ])
     }
     
     /// Add separator view for the given action view.
