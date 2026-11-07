@@ -29,10 +29,13 @@ final public class PopMenuPresentAnimationController: NSObject, UIViewController
         
         let containerView = transitionContext.containerView
         let view = menuViewController.view!
-        view.frame = containerView.frame
+        let finalFrame = transitionContext.finalFrame(for: menuViewController)
+        view.frame = finalFrame.isEmpty ? containerView.bounds : finalFrame
+        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         containerView.addSubview(view)
-        
+        menuViewController.prepareForPresentation()
         prepareAnimation(menuViewController)
+        view.layoutIfNeeded()
         
         let animationDuration = transitionDuration(using: transitionContext)
         let animations = {
@@ -49,7 +52,7 @@ final public class PopMenuPresentAnimationController: NSObject, UIViewController
         viewController.containerView.alpha = 0
         viewController.backgroundView.alpha = 0
         
-        if let sourceFrame = sourceFrame {
+        if let sourceFrame = viewController.absoluteSourceFrame, !sourceFrame.isEmpty {
             viewController.contentLeftConstraint.constant = sourceFrame.origin.x
             viewController.contentTopConstraint.constant = sourceFrame.origin.y
             viewController.contentWidthConstraint.constant = sourceFrame.size.width
@@ -68,7 +71,7 @@ final public class PopMenuPresentAnimationController: NSObject, UIViewController
         viewController.contentWidthConstraint.constant = contentFrame.size.width
         viewController.contentHeightConstraint.constant = contentFrame.size.height
         
-        viewController.containerView.layoutIfNeeded()
+        viewController.view.layoutIfNeeded()
     }
     
 }
